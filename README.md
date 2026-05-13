@@ -197,7 +197,7 @@ Change the port in `.env` (BACKEND_PORT / FRONTEND_PORT) and update the `make de
 
 ## Team
 
-- **Haider Ahmad** — Project lead, backend architecture, LLM integration, documentation
+- **Maimoona, Emaan and Abdullah** — Project lead, backend architecture, LLM integration, documentation
 
 ---
 
