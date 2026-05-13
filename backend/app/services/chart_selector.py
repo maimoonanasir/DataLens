@@ -1,18 +1,12 @@
 """Chart auto-selection service.
 
-Given a list of ColumnProfile objects, selects 4–6 meaningful chart types
+Given a list of ColumnProfile objects, selects 4-6 meaningful chart types
 appropriate to the data and returns ChartSpec objects the frontend renders.
 
-Selection algorithm
---------------------
-1. Line/Area chart  → first datetime column vs a numeric (revenue/sales over time)
-2. Bar chart        → highest-cardinality categorical (≤50 unique) vs numeric sum
-3. Horizontal bar   → second categorical vs numeric (top-N)
-4. Histogram        → most interesting numeric (highest std relative to mean)
-5. Scatter plot     → two numerics with lowest correlation to catch relationships
-6. Donut/Bar        → categorical with fewest unique values (e.g., boolean flags)
-
-The function always tries to return ≥ 4 charts and at most 6.
+This version is dataset-aware: it prioritises columns that look like
+outcome / measure variables (readmitted, A1Cresult, time_in_hospital,
+num_medications, diabetesMed, change) and excludes identifier columns
+(encounter_id, patient_nbr).
 """
 
 from __future__ import annotations
@@ -28,133 +22,192 @@ from backend.app.models.dataset import ColumnProfile
 # ---------------------------------------------------------------------------
 
 def select_charts(profiles: list[ColumnProfile]) -> list[ChartSpec]:
-    """Return 4–6 ChartSpec objects auto-selected from *profiles*.
+    """Return up to 6 ChartSpec objects, picking the most insightful charts."""
 
-    Args:
-        profiles: Output of profiler.profile_dataframe()
-
-    Returns:
-        Between 4 and 6 ChartSpec objects, ordered for dashboard display.
-    """
-    specs: list[ChartSpec] = []
-
-    numerics = [p for p in profiles if p.dtype == "numeric"]
-    categoricals = [p for p in profiles if p.dtype == "categorical"]
+    # Exclude IDs from being used as measures or x-axes
+    numerics = [p for p in profiles if p.dtype == "numeric" and not _is_id_column(p.name)]
+    categoricals = [p for p in profiles if p.dtype == "categorical" and not _is_id_column(p.name)]
     datetimes = [p for p in profiles if p.dtype == "datetime"]
 
-    # -----------------------------------------------------------------------
-    # 1. Time-series line chart (datetime × numeric)
-    # -----------------------------------------------------------------------
-    if datetimes and numerics:
-        dt_col = datetimes[0]
-        num_col = _pick_numeric_for_agg(numerics)
-        specs.append(ChartSpec(
-            chart_id=f"line_{dt_col.name.lower().replace(' ', '_')}",
-            chart_type="line",
-            title=f"{num_col.name} Over Time",
-            x_col=dt_col.name,
-            y_col=num_col.name,
-            agg="sum",
-            limit=100,
-        ))
+    by_name = {p.name.lower(): p for p in profiles}
+
+    specs: list[ChartSpec] = []
+    used_columns: set[str] = set()
+
+    def has(name: str) -> bool:
+        return name.lower() in by_name
+
+    def col(name: str) -> ColumnProfile:
+        return by_name[name.lower()]
 
     # -----------------------------------------------------------------------
-    # 2. Bar chart — top categorical × numeric
+    # 1. KEY OUTCOME — "Readmission status" or similar binary/tri-class column
     # -----------------------------------------------------------------------
-    if categoricals and numerics:
-        cat_col = _pick_categorical(categoricals, prefer_mid_cardinality=True)
-        num_col = _pick_numeric_for_agg(numerics)
+    outcome_candidates = ["readmitted", "outcome", "status", "result", "label", "target", "churn"]
+    for c in outcome_candidates:
+        if has(c) and c not in used_columns:
+            p = col(c)
+            specs.append(ChartSpec(
+                chart_id=f"count_{c}",
+                chart_type="bar",
+                title=f"Patient Count by {p.name}",
+                x_col=p.name,
+                y_col=None,
+                agg="count",
+                limit=20,
+            ))
+            used_columns.add(c)
+            break
+
+    # -----------------------------------------------------------------------
+    # 2. KEY MEASURE BY DEMOGRAPHIC — e.g. "Average time_in_hospital by age"
+    # -----------------------------------------------------------------------
+    measure_candidates = [
+        "time_in_hospital", "los", "length_of_stay", "duration_days",
+        "num_medications", "num_lab_procedures", "total", "amount", "revenue",
+    ]
+    demo_candidates = ["age", "age_group", "gender", "race", "region", "country", "department"]
+
+    measure_col_name = next((m for m in measure_candidates if has(m) and m not in used_columns), None)
+    demo_col_name = next((d for d in demo_candidates if has(d) and d not in used_columns), None)
+
+    if measure_col_name and demo_col_name:
+        m = col(measure_col_name)
+        d = col(demo_col_name)
         specs.append(ChartSpec(
-            chart_id=f"bar_{cat_col.name.lower().replace(' ', '_')}",
+            chart_id=f"avg_{measure_col_name}_by_{demo_col_name}",
             chart_type="bar",
-            title=f"{num_col.name} by {cat_col.name}",
-            x_col=cat_col.name,
-            y_col=num_col.name,
-            agg="sum",
+            title=f"Average {m.name} by {d.name}",
+            x_col=d.name,
+            y_col=m.name,
+            agg="mean",
             limit=20,
         ))
+        used_columns.add(measure_col_name)
+        used_columns.add(demo_col_name)
 
     # -----------------------------------------------------------------------
-    # 3. Horizontal bar — second categorical (top-N)
+    # 3. DEMOGRAPHIC BREAKDOWN — Patient count by age (or another demographic)
     # -----------------------------------------------------------------------
-    remaining_cats = [c for c in categoricals if c.name != (specs[-1].x_col if specs else "")]
-    if remaining_cats and numerics:
-        cat2 = _pick_categorical(remaining_cats, prefer_mid_cardinality=False)
-        num2 = _pick_numeric_for_agg(numerics)
-        specs.append(ChartSpec(
-            chart_id=f"hbar_{cat2.name.lower().replace(' ', '_')}",
-            chart_type="hbar",
-            title=f"Top {cat2.name} by {num2.name}",
-            x_col=cat2.name,
-            y_col=num2.name,
-            agg="sum",
-            limit=15,
-        ))
+    for d in demo_candidates:
+        if has(d) and d not in used_columns:
+            p = col(d)
+            if 2 <= p.unique_count <= 30:
+                specs.append(ChartSpec(
+                    chart_id=f"count_{d}",
+                    chart_type="hbar" if p.unique_count > 6 else "bar",
+                    title=f"Patient Count by {p.name}",
+                    x_col=p.name,
+                    y_col=None,
+                    agg="count",
+                    limit=20,
+                ))
+                used_columns.add(d)
+                break
 
     # -----------------------------------------------------------------------
-    # 4. Histogram — most variable numeric
+    # 4. MEDICATION USAGE — diabetesMed, change, insulin, or generic binary med flag
     # -----------------------------------------------------------------------
-    if numerics:
-        num_hist = _pick_most_variable_numeric(numerics)
-        specs.append(ChartSpec(
-            chart_id=f"hist_{num_hist.name.lower().replace(' ', '_')}",
-            chart_type="histogram",
-            title=f"Distribution of {num_hist.name}",
-            x_col=num_hist.name,
-            y_col=None,
-            agg="count",
-            limit=30,
-        ))
+    med_candidates = ["diabetesmed", "insulin", "metformin", "change", "medication", "treatment"]
+    for c in med_candidates:
+        if has(c) and c not in used_columns:
+            p = col(c)
+            if 2 <= p.unique_count <= 10:
+                specs.append(ChartSpec(
+                    chart_id=f"count_{c}",
+                    chart_type="bar",
+                    title=f"Patient Count by {p.name}",
+                    x_col=p.name,
+                    y_col=None,
+                    agg="count",
+                    limit=20,
+                ))
+                used_columns.add(c)
+                break
 
     # -----------------------------------------------------------------------
-    # 5. Scatter plot — two numerics (if available)
+    # 5. LAB RESULT / SEVERITY — A1Cresult, max_glu_serum, severity
     # -----------------------------------------------------------------------
-    if len(numerics) >= 2:
-        n1, n2 = _pick_scatter_pair(numerics)
-        specs.append(ChartSpec(
-            chart_id=f"scatter_{n1.name.lower().replace(' ', '_')}_{n2.name.lower().replace(' ', '_')}",
-            chart_type="scatter",
-            title=f"{n1.name} vs {n2.name}",
-            x_col=n1.name,
-            y_col=n2.name,
-            agg="none",
-            limit=500,
-        ))
+    lab_candidates = ["a1cresult", "max_glu_serum", "severity", "grade", "stage", "level"]
+    for c in lab_candidates:
+        if has(c) and c not in used_columns:
+            p = col(c)
+            if p.unique_count <= 15:
+                specs.append(ChartSpec(
+                    chart_id=f"count_{c}",
+                    chart_type="bar",
+                    title=f"Patient Count by {p.name}",
+                    x_col=p.name,
+                    y_col=None,
+                    agg="count",
+                    limit=20,
+                ))
+                used_columns.add(c)
+                break
 
     # -----------------------------------------------------------------------
-    # 6. Count bar — low-cardinality categorical (if not already used)
+    # 6. DISTRIBUTION OF A KEY NUMERIC — fill remaining slot with histogram
     # -----------------------------------------------------------------------
-    used_cats = {s.x_col for s in specs}
-    low_card_cats = [c for c in categoricals if c.name not in used_cats and c.unique_count <= 10]
-    if low_card_cats and len(specs) < 6:
-        cat3 = low_card_cats[0]
-        specs.append(ChartSpec(
-            chart_id=f"count_{cat3.name.lower().replace(' ', '_')}",
-            chart_type="bar",
-            title=f"Order Count by {cat3.name}",
-            x_col=cat3.name,
-            y_col=None,
-            agg="count",
-            limit=20,
-        ))
+    if len(specs) < 6:
+        hist_candidates = [n for n in numerics if n.name.lower() not in used_columns]
+        if hist_candidates:
+            preferred = ["time_in_hospital", "num_medications", "num_lab_procedures", "num_procedures"]
+            chosen = None
+            for p in preferred:
+                if has(p) and p not in used_columns:
+                    chosen = col(p)
+                    used_columns.add(p)
+                    break
+            if chosen is None:
+                chosen = _pick_most_variable_numeric(hist_candidates)
+                used_columns.add(chosen.name.lower())
+            specs.append(ChartSpec(
+                chart_id=f"hist_{chosen.name.lower()}",
+                chart_type="histogram",
+                title=f"Distribution of {chosen.name}",
+                x_col=chosen.name,
+                y_col=None,
+                agg="count",
+                limit=30,
+            ))
 
-    # Clamp to 4–6
+    # -----------------------------------------------------------------------
+    # FALLBACK — Generic charts if we still have < 4
+    # -----------------------------------------------------------------------
+    if len(specs) < 4 and categoricals:
+        for c in categoricals:
+            if len(specs) >= 4:
+                break
+            if c.name.lower() in used_columns:
+                continue
+            if 2 <= c.unique_count <= 30:
+                specs.append(ChartSpec(
+                    chart_id=f"count_extra_{c.name.lower()}",
+                    chart_type="bar",
+                    title=f"Patient Count by {c.name}",
+                    x_col=c.name,
+                    y_col=None,
+                    agg="count",
+                    limit=20,
+                ))
+                used_columns.add(c.name.lower())
+
     if len(specs) < 4 and numerics:
-        # Fallback: add more numeric histograms
         for n in numerics:
             if len(specs) >= 4:
                 break
-            cid = f"hist_extra_{n.name.lower().replace(' ', '_')}"
-            if not any(s.chart_id == cid for s in specs):
-                specs.append(ChartSpec(
-                    chart_id=cid,
-                    chart_type="histogram",
-                    title=f"Distribution of {n.name}",
-                    x_col=n.name,
-                    y_col=None,
-                    agg="count",
-                    limit=30,
-                ))
+            if n.name.lower() in used_columns:
+                continue
+            specs.append(ChartSpec(
+                chart_id=f"hist_extra_{n.name.lower()}",
+                chart_type="histogram",
+                title=f"Distribution of {n.name}",
+                x_col=n.name,
+                y_col=None,
+                agg="count",
+                limit=30,
+            ))
+            used_columns.add(n.name.lower())
 
     return specs[:6]
 
@@ -163,30 +216,17 @@ def select_charts(profiles: list[ColumnProfile]) -> list[ChartSpec]:
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _pick_numeric_for_agg(numerics: list[ColumnProfile]) -> ColumnProfile:
-    """Pick the numeric column most appropriate for SUM aggregation.
-
-    Prefers columns that look like value/amount/price/revenue.
-    """
-    keywords = ("price", "amount", "revenue", "value", "sales", "quantity", "qty", "total")
-    for kw in keywords:
-        for n in numerics:
-            if kw in n.name.lower():
-                return n
-    return numerics[0]
-
-
-def _pick_categorical(cats: list[ColumnProfile], prefer_mid_cardinality: bool) -> ColumnProfile:
-    """Pick a categorical column.
-
-    If prefer_mid_cardinality=True, prefer columns with 5–50 unique values
-    (good for bar charts with readable x-axis labels).
-    """
-    if prefer_mid_cardinality:
-        mid = [c for c in cats if 5 <= c.unique_count <= 50]
-        if mid:
-            return mid[0]
-    return cats[0]
+def _is_id_column(name: str) -> bool:
+    """Return True if *name* looks like an identifier rather than a measure."""
+    n = name.lower().strip()
+    if n in {"id", "uuid", "guid", "ssn", "key"}:
+        return True
+    if n.endswith(("_id", "_nbr", "_num", "_key", "_uuid")):
+        return True
+    # 'number' as suffix is usually an identifier, but keep counts named 'number_*'
+    if n.endswith("number") and not n.startswith("number_"):
+        return True
+    return False
 
 
 def _pick_most_variable_numeric(numerics: list[ColumnProfile]) -> ColumnProfile:
@@ -202,20 +242,3 @@ def _pick_most_variable_numeric(numerics: list[ColumnProfile]) -> ColumnProfile:
                 best_cv = cv
                 best = n
     return best
-
-
-def _pick_scatter_pair(numerics: list[ColumnProfile]) -> tuple[ColumnProfile, ColumnProfile]:
-    """Pick two numeric columns for a scatter plot.
-
-    Prefers pairs that represent different concepts (e.g., price × quantity).
-    """
-    price_kw = ("price", "unit", "value", "cost")
-    qty_kw = ("quantity", "qty", "count", "amount", "volume")
-
-    price_cols = [n for n in numerics if any(k in n.name.lower() for k in price_kw)]
-    qty_cols = [n for n in numerics if any(k in n.name.lower() for k in qty_kw)]
-
-    if price_cols and qty_cols and price_cols[0] != qty_cols[0]:
-        return price_cols[0], qty_cols[0]
-
-    return numerics[0], numerics[1]
